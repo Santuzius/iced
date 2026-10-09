@@ -461,6 +461,13 @@ where
 
                     shell.capture_event();
                 } else if cursor.is_over(layout.bounds()) {
+                    // ANDROID: see `State::is_touched`.
+                    if let Event::Touch(_) = event {
+                        state.is_touched = true;
+                        shell.capture_event();
+                        return;
+                    }
+
                     let selected = self.selected.as_ref().map(Borrow::borrow);
 
                     state.is_open = true;
@@ -476,6 +483,28 @@ where
 
                     shell.capture_event();
                 }
+            }
+            Event::Touch(touch::Event::FingerLost { .. }) => {
+                state.is_touched = false;
+            }
+            Event::Touch(touch::Event::FingerLifted { .. })
+                if std::mem::take(&mut state.is_touched)
+                    && cursor.is_over(layout.bounds()) =>
+            {
+                let selected = self.selected.as_ref().map(Borrow::borrow);
+
+                state.is_open = true;
+                state.hovered_option = self
+                    .options
+                    .borrow()
+                    .iter()
+                    .position(|option| Some(option) == selected);
+
+                if let Some(on_open) = &self.on_open {
+                    shell.publish(on_open.clone());
+                }
+
+                shell.capture_event();
             }
             Event::Mouse(mouse::Event::WheelScrolled {
                 delta: mouse::ScrollDelta::Lines { y, .. },
@@ -767,6 +796,8 @@ struct State<P: text::Paragraph> {
     hovered_option: Option<usize>,
     options: Vec<paragraph::Plain<P>>,
     placeholder: paragraph::Plain<P>,
+    // ANDROID: a finger went down on the closed pick list. It opens when the finger lifts, as on phones, so a swipe that starts on it scrolls the page instead (the scrollable then sends `FingerLost`).
+    is_touched: bool,
 }
 
 impl<P: text::Paragraph> State<P> {
@@ -779,6 +810,7 @@ impl<P: text::Paragraph> State<P> {
             hovered_option: Option::default(),
             options: Vec::new(),
             placeholder: paragraph::Plain::default(),
+            is_touched: false,
         }
     }
 }

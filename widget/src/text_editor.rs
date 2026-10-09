@@ -44,6 +44,7 @@ use crate::core::text::highlighter::{self, Highlighter};
 use crate::core::text::{self, LineHeight, Text, Wrapping};
 use crate::core::theme;
 use crate::core::time::{Duration, Instant};
+use crate::core::touch;
 use crate::core::widget::operation;
 use crate::core::widget::{self, Widget};
 use crate::core::window;
@@ -356,6 +357,76 @@ where
         let text_bounds = bounds.shrink(self.padding);
         let translation = text_bounds.position() - Point::ORIGIN;
 
+        // ANDROID: tell soft keyboards what surrounds the cursor or selection, from the neighbouring lines only.
+        #[cfg(target_os = "android")]
+        {
+            let cursor = internal.editor.cursor();
+            let (start, end) = match cursor.selection {
+                Some(other)
+                    if (other.line, other.column)
+                        < (cursor.position.line, cursor.position.column) =>
+                {
+                    (other, cursor.position)
+                }
+                Some(other) => (cursor.position, other),
+                None => (cursor.position, cursor.position),
+            };
+            let line = |index: usize| {
+                internal
+                    .editor
+                    .line(index)
+                    .map(|line| line.text.into_owned())
+                    .unwrap_or_default()
+            };
+            // Columns are byte offsets; keep them on character boundaries.
+            let split = |text: &str, column: usize| {
+                (0..=column.min(text.len()))
+                    .rev()
+                    .find(|index| text.is_char_boundary(*index))
+                    .unwrap_or(0)
+            };
+
+            let first = line(start.line);
+            let last = line(end.line);
+            let start_column = split(&first, start.column);
+            let end_column = split(&last, end.column);
+
+            let mut before = String::new();
+
+            for index in start.line.saturating_sub(5)..start.line {
+                before.push_str(&line(index));
+                before.push('\n');
+            }
+
+            before.push_str(&first[..start_column]);
+
+            let selected = if start.line == end.line {
+                first[start_column..end_column.max(start_column)].to_owned()
+            } else {
+                let mut selected = first[start_column..].to_owned();
+
+                for index in start.line + 1..end.line {
+                    selected.push('\n');
+                    selected.push_str(&line(index));
+                }
+
+                selected.push('\n');
+                selected.push_str(&last[..end_column]);
+                selected
+            };
+
+            let mut after = last[end_column..].to_owned();
+
+            for index in end.line + 1..end.line + 6 {
+                if let Some(next) = internal.editor.line(index) {
+                    after.push('\n');
+                    after.push_str(&next.text);
+                }
+            }
+
+            crate::ime_context::set(&before, &selected, &after, false);
+        }
+
         let cursor = match internal.editor.selection() {
             Selection::Caret(position) => position,
             Selection::Range(ranges) => {
@@ -527,10 +598,30 @@ pub struct State<Highlighter: text::Highlighter> {
     last_click: Option<mouse::Click>,
     drag_click: Option<mouse::click::Kind>,
     partial_scroll: f32,
+    // ANDROID: the finger currently on the editor, if any.
+    touch: Option<Touch>,
+    // ANDROID: a finger that went down outside the focused editor, at this window position. Lifting it without moving unfocuses; scrolling the page keeps the focus and the keyboard.
+    unfocus_touch: Option<Point>,
     last_theme: RefCell<Option<String>>,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format_address: usize,
+}
+
+/// ANDROID: a finger on the editor, as in Android's own text views:
+/// - dragging scrolls
+/// - a tap without movement places the cursor like a click
+/// - resting for `ime_context::LONG_PRESS` selects the word under the finger; dragging then extends the selection and lifting opens the text menu
+#[derive(Debug, Clone, Copy)]
+struct Touch {
+    at: Instant,
+    /// Positions relative to the text area.
+    start: Point,
+    last: Point,
+    /// Position in the window, for the menu.
+    window_position: Point,
+    is_drag: bool,
+    is_long: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +693,8 @@ where
             last_click: None,
             drag_click: None,
             partial_scroll: 0.0,
+            touch: None,
+            unfocus_touch: None,
             last_theme: RefCell::default(),
             highlighter: RefCell::new(Highlighter::new(
                 &self.highlighter_settings,
@@ -711,6 +804,26 @@ where
                 }
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
+                // ANDROID: select the word under a resting finger.
+                if let Some(touch) = &mut state.touch
+                    && !touch.is_drag
+                    && !touch.is_long
+                {
+                    let deadline = touch.at + crate::ime_context::LONG_PRESS;
+
+                    if *now >= deadline {
+                        touch.is_long = true;
+                        let position = touch.start;
+
+                        state.focus = Some(Focus::now());
+                        shell.publish(on_edit(Action::Click(position)));
+                        shell.publish(on_edit(Action::SelectWord));
+                    } else {
+                        // Redraw requests last until the next redraw only.
+                        shell.request_redraw_at(deadline);
+                    }
+                }
+
                 if let Some(focus) = &mut state.focus
                     && focus.is_window_focused
                 {
@@ -757,6 +870,102 @@ where
                 }
                 Update::Drag(position) => {
                     shell.publish(on_edit(Action::Drag(position)));
+                }
+                Update::TouchPress(position, window_position) => {
+                    let now = Instant::now();
+
+                    state.touch = Some(Touch {
+                        at: now,
+                        start: position,
+                        last: position,
+                        window_position,
+                        is_drag: false,
+                        is_long: false,
+                    });
+
+                    shell.request_redraw_at(
+                        now + crate::ime_context::LONG_PRESS,
+                    );
+                    shell.capture_event();
+                }
+                Update::TouchOutside(position) => {
+                    state.unfocus_touch = position;
+                }
+                Update::TouchOutsideLift => {
+                    state.unfocus_touch = None;
+                    state.focus = None;
+                    state.drag_click = None;
+                }
+                Update::TouchMove(position) => {
+                    let Some(touch) = &mut state.touch else {
+                        return;
+                    };
+
+                    if touch.is_long {
+                        shell.publish(on_edit(Action::Drag(position)));
+                        shell.capture_event();
+                        return;
+                    }
+
+                    if !touch.is_drag
+                        && position.distance(touch.start)
+                            > crate::ime_context::TOUCH_SLOP
+                    {
+                        touch.is_drag = true;
+                    }
+
+                    if touch.is_drag {
+                        let line_height = f32::from(
+                            self.line_height
+                                .to_absolute(self.text_size.unwrap_or_else(
+                                    || renderer.default_size(),
+                                )),
+                        );
+                        let lines = (touch.last.y - position.y) / line_height
+                            + state.partial_scroll;
+                        touch.last = position;
+                        state.partial_scroll = lines.fract();
+
+                        if lines.abs() >= 1.0 {
+                            shell.publish(on_edit(Action::Scroll {
+                                lines: lines as i32,
+                            }));
+                        }
+                    }
+
+                    shell.capture_event();
+                }
+                Update::TouchLift => {
+                    let Some(touch) = state.touch.take() else {
+                        return;
+                    };
+
+                    if touch.is_long {
+                        crate::ime_context::show_menu(
+                            touch.window_position,
+                            self.content.selection().is_some(),
+                        );
+                    } else if !touch.is_drag {
+                        let click = mouse::Click::new(
+                            touch.start,
+                            mouse::Button::Left,
+                            state.last_click,
+                        );
+                        let action = match click.kind() {
+                            mouse::click::Kind::Single => {
+                                Action::Click(click.position())
+                            }
+                            mouse::click::Kind::Double => Action::SelectWord,
+                            mouse::click::Kind::Triple => Action::SelectLine,
+                        };
+
+                        state.focus = Some(Focus::now());
+                        state.last_click = Some(click);
+
+                        shell.publish(on_edit(action));
+                    }
+
+                    shell.capture_event();
                 }
                 Update::Release => {
                     state.drag_click = None;
@@ -1256,6 +1465,13 @@ impl<Message> Binding<Message> {
 
 enum Update<Message> {
     Click(mouse::Click),
+    // ANDROID: positions are relative to the text area, like `Click`.
+    TouchPress(Point, Point),
+    // ANDROID: see `State::unfocus_touch`; `None` cancels.
+    TouchOutside(Option<Point>),
+    TouchOutsideLift,
+    TouchMove(Point),
+    TouchLift,
     Drag(Point),
     Release,
     Scroll(f32),
@@ -1331,6 +1547,64 @@ impl<Message> Update<Message> {
                 }
                 _ => None,
             },
+            // ANDROID: upstream text_editor only reacts to the mouse.
+            Event::Touch(event) => {
+                // The cursor follows the finger and, unlike the event's position, accounts for scrolling.
+                let relative = |_: &Point| {
+                    cursor.position().map(|position| {
+                        position
+                            - Vector::new(
+                                bounds.x + padding.left,
+                                bounds.y + padding.top,
+                            )
+                    })
+                };
+
+                match event {
+                    touch::Event::FingerPressed { position, .. } => {
+                        if cursor.is_over(bounds) {
+                            Some(Update::TouchPress(
+                                relative(position)?,
+                                *position,
+                            ))
+                        } else if state.focus.is_some() {
+                            Some(Update::TouchOutside(Some(*position)))
+                        } else {
+                            None
+                        }
+                    }
+                    touch::Event::FingerMoved { position, .. }
+                        if state.unfocus_touch.is_some_and(|start| {
+                            position.distance(start)
+                                > crate::ime_context::TOUCH_SLOP
+                        }) =>
+                    {
+                        Some(Update::TouchOutside(None))
+                    }
+                    touch::Event::FingerLifted { .. }
+                        if state.unfocus_touch.is_some() =>
+                    {
+                        Some(Update::TouchOutsideLift)
+                    }
+                    touch::Event::FingerLost { .. }
+                        if state.unfocus_touch.is_some() =>
+                    {
+                        Some(Update::TouchOutside(None))
+                    }
+                    touch::Event::FingerMoved { position, .. }
+                        if state.touch.is_some() =>
+                    {
+                        Some(Update::TouchMove(relative(position)?))
+                    }
+                    touch::Event::FingerLifted { .. }
+                    | touch::Event::FingerLost { .. }
+                        if state.touch.is_some() =>
+                    {
+                        Some(Update::TouchLift)
+                    }
+                    _ => None,
+                }
+            }
             Event::InputMethod(event) => match event {
                 input_method::Event::Opened | input_method::Event::Closed => {
                     Some(Update::InputMethod(Ime::Toggle(matches!(

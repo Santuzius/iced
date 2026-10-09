@@ -407,6 +407,24 @@ where
         let secure_value = self.is_secure.then(|| value.secure());
         let value = secure_value.as_ref().unwrap_or(value);
 
+        // ANDROID: tell soft keyboards what surrounds the cursor. Password fields pass their masked text, so the keyboard knows what Backspace can delete without seeing the password.
+        #[cfg(target_os = "android")]
+        {
+            let (start, end) = match state.cursor.state(value) {
+                cursor::State::Index(position) => (position, position),
+                cursor::State::Selection { start, end } => {
+                    (start.min(end), start.max(end))
+                }
+            };
+
+            crate::ime_context::set(
+                &value.until(start).to_string(),
+                &value.select(start, end).to_string(),
+                &value.select(end, value.len()).to_string(),
+                true,
+            );
+        }
+
         let text_bounds = layout.children().next().unwrap().bounds();
 
         let caret_index = match state.cursor.state(value) {
@@ -722,6 +740,20 @@ where
 
                 let click_position = cursor.position_over(layout.bounds());
 
+                // ANDROID: see `State::unfocus_touch`.
+                if let Event::Touch(touch::Event::FingerPressed {
+                    position,
+                    ..
+                }) = event
+                    && click_position.is_none()
+                {
+                    if state.is_focused.is_some() {
+                        state.unfocus_touch = Some(*position);
+                    }
+
+                    return;
+                }
+
                 state.is_focused = if click_position.is_some() {
                     let now = Instant::now();
 
@@ -818,6 +850,29 @@ where
 
                     state.last_click = Some(click);
 
+                    // ANDROID: a single touch only places the cursor; see `TouchPress`.
+                    state.touch = None;
+
+                    if let Event::Touch(touch::Event::FingerPressed {
+                        position,
+                        ..
+                    }) = event
+                        && click.kind() == click::Kind::Single
+                    {
+                        let now = Instant::now();
+
+                        state.is_dragging = None;
+                        state.touch = Some(TouchPress {
+                            at: now,
+                            position: *position,
+                            target,
+                            is_long: false,
+                        });
+                        shell.request_redraw_at(
+                            now + crate::ime_context::LONG_PRESS,
+                        );
+                    }
+
                     if cursor_before != state.cursor {
                         shell.request_redraw();
                     }
@@ -828,11 +883,54 @@ where
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. })
             | Event::Touch(touch::Event::FingerLost { .. }) => {
-                state::<Renderer>(tree).is_dragging = None;
+                let state = state::<Renderer>(tree);
+                state.is_dragging = None;
+
+                // ANDROID: see `State::unfocus_touch`.
+                if state.unfocus_touch.take().is_some()
+                    && matches!(
+                        event,
+                        Event::Touch(touch::Event::FingerLifted { .. })
+                    )
+                {
+                    state.is_focused = None;
+                    shell.request_redraw();
+                }
+
+                // ANDROID: the text menu after a long press.
+                if let Some(touch) = state.touch.take()
+                    && touch.is_long
+                    && matches!(
+                        event,
+                        Event::Touch(touch::Event::FingerLifted { .. })
+                    )
+                {
+                    let has_selection = !self.is_secure
+                        && state.cursor.selection(&self.value).is_some();
+                    crate::ime_context::show_menu(
+                        touch.position,
+                        has_selection,
+                    );
+                }
             }
             Event::Mouse(mouse::Event::CursorMoved { position })
             | Event::Touch(touch::Event::FingerMoved { position, .. }) => {
                 let state = state::<Renderer>(tree);
+
+                if state.unfocus_touch.is_some_and(|start| {
+                    position.distance(start) > crate::ime_context::TOUCH_SLOP
+                }) {
+                    state.unfocus_touch = None;
+                }
+
+                // ANDROID: a finger that moves before the long press is not resting.
+                if let Some(touch) = state.touch
+                    && !touch.is_long
+                    && position.distance(touch.position)
+                        > crate::ime_context::TOUCH_SLOP
+                {
+                    state.touch = None;
+                }
 
                 if let Some(is_dragging) = &state.is_dragging {
                     let text_layout = layout.children().next().unwrap();
@@ -1330,6 +1428,44 @@ where
             Event::Window(window::Event::RedrawRequested(now)) => {
                 let state = state::<Renderer>(tree);
 
+                // ANDROID: select the word under a resting finger, like a double click.
+                if let Some(touch) = state.touch
+                    && !touch.is_long
+                    && *now < touch.at + crate::ime_context::LONG_PRESS
+                {
+                    // Redraw requests last until the next redraw only.
+                    shell.request_redraw_at(
+                        touch.at + crate::ime_context::LONG_PRESS,
+                    );
+                } else if let Some(touch) = &mut state.touch
+                    && !touch.is_long
+                {
+                    touch.is_long = true;
+                    let target = touch.target;
+
+                    if self.is_secure {
+                        state.cursor.select_all(&self.value);
+                    } else {
+                        let text_layout = layout.children().next().unwrap();
+                        let position = find_cursor_position(
+                            text_layout.bounds(),
+                            &self.value,
+                            state,
+                            target,
+                        )
+                        .unwrap_or(0);
+
+                        state.cursor.select_range(
+                            self.value.previous_start_of_word(position),
+                            self.value.next_end_of_word(position),
+                        );
+                        state.is_dragging =
+                            Some(Drag::SelectWords { anchor: position });
+                    }
+
+                    shell.request_redraw();
+                }
+
                 if let Some(focus) = &mut state.is_focused
                     && focus.is_window_focused
                 {
@@ -1469,7 +1605,22 @@ pub struct State<P: text::Paragraph> {
     last_click: Option<mouse::Click>,
     cursor: Cursor,
     keyboard_modifiers: keyboard::Modifiers,
+    // ANDROID: a finger resting on the field, see `TouchPress`.
+    touch: Option<TouchPress>,
+    // ANDROID: a finger that went down outside the focused field, at this window position. Lifting it without moving unfocuses; scrolling the page keeps the focus and the keyboard.
+    unfocus_touch: Option<Point>,
     // TODO: Add stateful horizontal scrolling offset
+}
+
+/// ANDROID: a finger on the field. As in Android's own fields, dragging does not select; resting for `ime_context::LONG_PRESS` selects the word under the finger, further dragging extends the selection by words, and lifting opens the text menu.
+#[derive(Debug, Clone, Copy)]
+struct TouchPress {
+    at: Instant,
+    /// Position in the window, for the menu.
+    position: Point,
+    /// Horizontal position in the text, as for a click.
+    target: f32,
+    is_long: bool,
 }
 
 fn state<Renderer: text::Renderer>(

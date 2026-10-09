@@ -616,6 +616,68 @@ where
             }
         }
 
+        // ANDROID: one fling step per frame, before the content sees the redraw, which it may capture.
+        if let Event::Window(window::Event::RedrawRequested(now)) = event
+            && let Some(fling) = state.touch.fling
+        {
+            let seconds = fling
+                .last_frame
+                .map_or(0.0, |last| (*now - last).as_secs_f32());
+            let before = (state.offset_x, state.offset_y);
+
+            state.scroll(
+                self.direction.align(state.touch.velocity * seconds),
+                bounds,
+                content_bounds,
+            );
+            state.touch.velocity =
+                state.touch.velocity * (1.0 - Touch::FRICTION).powf(seconds);
+
+            let _ = notify_scroll(
+                state,
+                &self.on_scroll,
+                bounds,
+                content_bounds,
+                shell,
+            );
+
+            let at_edge =
+                seconds > 0.0 && before == (state.offset_x, state.offset_y);
+
+            if at_edge
+                || state.touch.velocity.x.hypot(state.touch.velocity.y) < 20.0
+            {
+                state.touch.fling = None;
+            } else {
+                state.touch.fling = Some(Fling {
+                    last_frame: Some(*now),
+                });
+                shell.request_redraw();
+            }
+        }
+
+        // ANDROID: a finger on a flinging list stops it, as on phones, and does not press what is under it.
+        if let Event::Touch(touch::Event::FingerPressed { .. }) = event {
+            state.touch.pressed_at = cursor_over_scrollable;
+            state.touch.velocity = Vector::ZERO;
+            state.touch.last_move = None;
+
+            // Only a fling that is still moving; one whose frames stopped for any reason must not swallow the tap.
+            let is_flinging = state.touch.fling.take().is_some_and(|fling| {
+                fling.last_frame.is_none_or(|last| {
+                    last.elapsed() < Duration::from_millis(100)
+                })
+            });
+
+            if is_flinging && cursor_over_scrollable.is_some() {
+                state.interaction = Interaction::TouchScrolling(
+                    cursor_over_scrollable.unwrap(),
+                );
+                shell.capture_event();
+                return;
+            }
+        }
+
         let mut update = || {
             if let Some(scroller_grabbed_at) = state.y_scroller_grabbed_at() {
                 match event {
@@ -835,8 +897,62 @@ where
                             | touch::Event::FingerLost { .. }
                     )
             ) {
+                // ANDROID: keep scrolling after a swipe if the finger was still moving fast when it lifted.
+                let was_moving = state.touch.last_move.is_some_and(|last| {
+                    last.elapsed() < Duration::from_millis(50)
+                });
+
+                if matches!(state.interaction, Interaction::TouchScrolling(_))
+                    && was_moving
+                    && state.touch.velocity.x.hypot(state.touch.velocity.y)
+                        >= Touch::MIN_FLING_SPEED
+                {
+                    state.touch.fling = Some(Fling { last_frame: None });
+                    shell.request_redraw();
+                }
+
+                state.touch.pressed_at = None;
                 state.interaction = Interaction::None;
                 return;
+            }
+
+            // ANDROID: a finger that went down on a widget which captured the press still scrolls once it moves along the scroll direction; the widget's press is cancelled.
+            if let Event::Touch(touch::Event::FingerMoved { id, position }) =
+                event
+                && !shell.is_event_captured()
+                && !matches!(state.interaction, Interaction::TouchScrolling(_))
+                && let Some(pressed_at) = state.touch.pressed_at
+            {
+                let moved = self.direction.align(*position - pressed_at);
+
+                if moved.x.hypot(moved.y) > Touch::SLOP {
+                    state.interaction = Interaction::TouchScrolling(pressed_at);
+                    state.touch.pressed_at = None;
+
+                    let translation = state.translation(
+                        self.direction,
+                        bounds,
+                        content_bounds,
+                    );
+
+                    self.content.as_widget_mut().update(
+                        &mut tree.children[0],
+                        &Event::Touch(touch::Event::FingerLost {
+                            id: *id,
+                            position: *position,
+                        }),
+                        content,
+                        cursor.levitate() + translation,
+                        renderer,
+                        clipboard,
+                        shell,
+                        &Rectangle {
+                            y: bounds.y + translation.y,
+                            x: bounds.x + translation.x,
+                            ..bounds
+                        },
+                    );
+                }
             }
 
             if shell.is_event_captured() {
@@ -949,6 +1065,19 @@ where
                                 scroll_box_touched_at.x - cursor_position.x,
                                 scroll_box_touched_at.y - cursor_position.y,
                             );
+
+                            // ANDROID: smoothed finger speed for a fling after lifting.
+                            let now = Instant::now();
+
+                            if let Some(last_move) = state.touch.last_move {
+                                let seconds =
+                                    (now - last_move).as_secs_f32().max(0.001);
+                                state.touch.velocity = state.touch.velocity
+                                    * 0.2
+                                    + delta * (0.8 / seconds);
+                            }
+
+                            state.touch.last_move = Some(now);
 
                             state.scroll(
                                 self.direction.align(delta),
@@ -1644,6 +1773,36 @@ struct State {
     last_notified: Option<Viewport>,
     last_scrolled: Option<Instant>,
     is_scrollbar_visible: bool,
+    // ANDROID: touch scrolling as on phones, see `Touch`.
+    touch: Touch,
+}
+
+/// ANDROID: what a finger on the scrollable does besides upstream's plain drag scrolling.
+///
+/// - Scrolling starts even when the finger went down on a button or other widget that captured the press; the widget then gets `FingerLost` and does not fire.
+/// - After a quick swipe the content keeps scrolling and slows down (fling).
+#[derive(Debug, Clone, Copy, Default)]
+struct Touch {
+    /// Where the finger went down, while it may still turn into a scroll.
+    pressed_at: Option<Point>,
+    /// Scroll speed in logical pixels per second, measured while dragging and decaying during a fling.
+    velocity: Vector,
+    last_move: Option<Instant>,
+    fling: Option<Fling>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Fling {
+    last_frame: Option<Instant>,
+}
+
+impl Touch {
+    /// How far a finger moves, in logical pixels, before a press becomes a scroll.
+    const SLOP: f32 = 8.0;
+    /// Slowest swipe, in logical pixels per second, that starts a fling.
+    const MIN_FLING_SPEED: f32 = 100.0;
+    /// Fraction of the speed lost per second during a fling; 1 - 0.95 keeps 5 % after one second.
+    const FRICTION: f32 = 0.95;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1669,6 +1828,7 @@ impl Default for State {
             last_notified: None,
             last_scrolled: None,
             is_scrollbar_visible: true,
+            touch: Touch::default(),
         }
     }
 }

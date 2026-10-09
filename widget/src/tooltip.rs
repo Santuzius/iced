@@ -31,6 +31,7 @@ use crate::core::overlay;
 use crate::core::renderer;
 use crate::core::text;
 use crate::core::time::{Duration, Instant};
+use crate::core::touch;
 use crate::core::widget::{self, Widget};
 use crate::core::window;
 use crate::core::{
@@ -216,8 +217,96 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Event::Mouse(_)
-        | Event::Window(window::Event::RedrawRequested(_)) = event
+        // ANDROID: tooltips on touch screens; see `State::Touched`.
+        {
+            let state = tree.state.downcast_mut::<State>();
+
+            if let Event::Touch(touch_event) = event {
+                let was_open = matches!(state, State::Open { .. });
+
+                match touch_event {
+                    touch::Event::FingerPressed { .. } => {
+                        if let Some(cursor_position) =
+                            cursor.position_over(layout.bounds())
+                        {
+                            let now = Instant::now();
+                            *state = State::Touched {
+                                at: now,
+                                cursor_position,
+                            };
+                            shell.request_redraw_at(
+                                now + crate::ime_context::LONG_PRESS,
+                            );
+                        } else {
+                            *state = State::TouchIdle;
+                        }
+                    }
+                    touch::Event::FingerMoved { position, .. } => {
+                        if let State::Touched {
+                            cursor_position, ..
+                        } = *state
+                            && position.distance(cursor_position)
+                                > crate::ime_context::TOUCH_SLOP
+                        {
+                            *state = State::TouchIdle;
+                        }
+                    }
+                    touch::Event::FingerLifted { id, position }
+                    | touch::Event::FingerLost { id, position } => {
+                        *state = State::TouchIdle;
+
+                        // A long press showed the tooltip; it does not also press the content (e.g. a button).
+                        if was_open {
+                            shell.invalidate_layout();
+                            shell.request_redraw();
+
+                            self.content.as_widget_mut().update(
+                                &mut tree.children[0],
+                                &Event::Touch(touch::Event::FingerLost {
+                                    id: *id,
+                                    position: *position,
+                                }),
+                                layout,
+                                cursor,
+                                renderer,
+                                clipboard,
+                                shell,
+                                viewport,
+                            );
+                            return;
+                        }
+                    }
+                }
+            } else if let Event::Mouse(_) = event
+                && *state == State::TouchIdle
+            {
+                *state = State::Idle;
+            } else if let Event::Window(window::Event::RedrawRequested(now)) =
+                event
+                && let State::Touched {
+                    at,
+                    cursor_position,
+                } = *state
+            {
+                if *now >= at + crate::ime_context::LONG_PRESS {
+                    *state = State::Open { cursor_position };
+                    shell.invalidate_layout();
+                } else {
+                    // Redraw requests last until the next redraw only.
+                    shell
+                        .request_redraw_at(at + crate::ime_context::LONG_PRESS);
+                }
+            }
+        }
+
+        let is_touch = matches!(
+            *tree.state.downcast_ref::<State>(),
+            State::Touched { .. } | State::TouchIdle
+        ) || matches!(event, Event::Touch(_));
+
+        if !is_touch
+            && let Event::Mouse(_)
+            | Event::Window(window::Event::RedrawRequested(_)) = event
         {
             let state = tree.state.downcast_mut::<State>();
             let now = Instant::now();
@@ -267,6 +356,7 @@ where
                     }
                 }
                 (State::Open { .. }, Some(_)) | (State::Idle, None) => (),
+                (State::Touched { .. } | State::TouchIdle, _) => (),
             }
         }
 
@@ -428,6 +518,13 @@ enum State {
     Open {
         cursor_position: Point,
     },
+    // ANDROID: touch screens have no hover. A finger resting on the content opens the tooltip after `ime_context::LONG_PRESS`, and lifting it closes the tooltip.
+    Touched {
+        at: Instant,
+        cursor_position: Point,
+    },
+    /// The last input was touch; the cursor position left behind by the finger is no hover.
+    TouchIdle,
 }
 
 struct Overlay<'a, 'b, Message, Theme, Renderer>
