@@ -75,13 +75,15 @@ where
                 raw: window,
                 state,
                 exit_on_close_request,
-                surface,
+                surface: Some(surface),
                 surface_version,
                 renderer,
                 mouse_interaction: mouse::Interaction::None,
                 redraw_at: None,
                 preedit: None,
                 ime_state: None,
+                #[cfg(target_os = "android")]
+                reshow_keyboard: false,
             },
         );
 
@@ -167,12 +169,15 @@ where
     pub state: State<P>,
     pub exit_on_close_request: bool,
     pub mouse_interaction: mouse::Interaction,
-    pub surface: C::Surface,
+    // ANDROID: `None` while the app is in the background, where Android has destroyed the native window behind the surface.
+    pub surface: Option<C::Surface>,
     pub surface_version: u64,
     pub renderer: P::Renderer,
     pub redraw_at: Option<Instant>,
     preedit: Option<Preedit<P::Renderer>>,
     ime_state: Option<(Rectangle, input_method::Purpose)>,
+    #[cfg(target_os = "android")]
+    reshow_keyboard: bool,
 }
 
 impl<P, C> Window<P, C>
@@ -279,6 +284,19 @@ where
         cursor: Rectangle,
         purpose: input_method::Purpose,
     ) {
+        // ANDROID: winit's `set_ime_allowed` targets NativeActivity's own view, which has no input connection; the app's Java view takes the keyboard instead.
+        #[cfg(target_os = "android")]
+        if self.reshow_keyboard
+            || self.ime_state.map(|(_, current)| current) != Some(purpose)
+        {
+            self.reshow_keyboard = false;
+
+            if let Some(platform) = crate::android::platform() {
+                platform.show_keyboard(purpose);
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
         if self.ime_state.is_none() {
             self.raw.set_ime_allowed(true);
         }
@@ -294,9 +312,28 @@ where
         }
     }
 
+    /// ANDROID: shows the keyboard again on the next IME request, in case the user dismissed it.
+    #[cfg(target_os = "android")]
+    pub fn reshow_keyboard(&mut self) {
+        self.reshow_keyboard = true;
+    }
+
     fn disable_ime(&mut self) {
+        #[cfg(target_os = "android")]
+        {
+            self.reshow_keyboard = false;
+        }
+
         if self.ime_state.is_some() {
+            // ANDROID: see `enable_ime`.
+            #[cfg(target_os = "android")]
+            if let Some(platform) = crate::android::platform() {
+                platform.hide_keyboard();
+            }
+
+            #[cfg(not(target_os = "android"))]
             self.raw.set_ime_allowed(false);
+
             self.ime_state = None;
         }
 

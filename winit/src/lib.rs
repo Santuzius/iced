@@ -29,6 +29,10 @@ pub use winit;
 pub mod clipboard;
 pub mod conversion;
 
+// ANDROID: glue for running the regular iced runtime on Android.
+#[cfg(target_os = "android")]
+pub mod android;
+
 mod error;
 mod proxy;
 mod window;
@@ -76,9 +80,18 @@ where
     let settings = program.settings();
     let window_settings = program.window();
 
-    let event_loop = EventLoop::with_user_event()
-        .build()
-        .expect("Create event loop");
+    #[allow(unused_mut)]
+    let mut builder = EventLoop::with_user_event();
+
+    // ANDROID: winit needs the activity handed to `android_main`.
+    #[cfg(target_os = "android")]
+    {
+        use winit::platform::android::EventLoopBuilderExtAndroid;
+
+        let _ = builder.with_android_app(android::app());
+    }
+
+    let event_loop = builder.build().expect("Create event loop");
 
     let graphics_settings = settings.clone().into();
     let display_handle = event_loop.owned_display_handle();
@@ -91,6 +104,18 @@ where
 
         debug::on_hotpatch(move || {
             proxy.send_action(Action::Reload);
+        });
+    }
+
+    // ANDROID: Java callbacks queue events from the UI thread and wake the event loop through the proxy.
+    #[cfg(target_os = "android")]
+    {
+        let proxy = proxy.clone();
+
+        android::set_waker(move || {
+            proxy.send_action(Action::Window(
+                runtime::window::Action::RedrawAll,
+            ));
         });
     }
 
@@ -125,6 +150,8 @@ where
 
     let (event_sender, event_receiver) = mpsc::unbounded();
     let (control_sender, control_receiver) = mpsc::unbounded();
+    #[cfg(target_os = "android")]
+    let deferred_control_sender = control_sender.clone();
     let (system_theme_sender, system_theme_receiver) = oneshot::channel();
 
     let instance = Box::pin(run_instance::<P>(
@@ -153,6 +180,14 @@ where
 
         #[cfg(target_arch = "wasm32")]
         canvas: Option<web_sys::HtmlCanvasElement>,
+
+        // ANDROID: windows can only be created while Android provides a native window, i.e. between `resumed` and `suspended`. Earlier requests wait here.
+        #[cfg(target_os = "android")]
+        has_native_window: bool,
+        #[cfg(target_os = "android")]
+        deferred: Vec<Control>,
+        #[cfg(target_os = "android")]
+        control_sender: mpsc::UnboundedSender<Control>,
     }
 
     let runner = Runner {
@@ -166,6 +201,13 @@ where
 
         #[cfg(target_arch = "wasm32")]
         canvas: None,
+
+        #[cfg(target_os = "android")]
+        has_native_window: false,
+        #[cfg(target_os = "android")]
+        deferred: Vec::new(),
+        #[cfg(target_os = "android")]
+        control_sender: deferred_control_sender,
     };
 
     boot_span.finish();
@@ -184,6 +226,28 @@ where
                         .unwrap_or_default(),
                 );
             }
+
+            // ANDROID: the native window exists again; replay deferred window requests and rebuild surfaces.
+            #[cfg(target_os = "android")]
+            {
+                self.has_native_window = true;
+
+                for control in self.deferred.drain(..) {
+                    let _ = self.control_sender.unbounded_send(control);
+                }
+
+                self.process_event(event_loop, Event::Resumed);
+            }
+        }
+
+        // ANDROID: the app went to the background and Android is destroying the native window. Drop the surfaces before returning.
+        #[cfg(target_os = "android")]
+        fn suspended(
+            &mut self,
+            event_loop: &winit::event_loop::ActiveEventLoop,
+        ) {
+            self.has_native_window = false;
+            self.process_event(event_loop, Event::Suspended);
         }
 
         fn new_events(
@@ -297,6 +361,12 @@ where
                                         event_loop.set_control_flow(flow);
                                     }
                                 }
+                            }
+                            #[cfg(target_os = "android")]
+                            control @ Control::CreateWindow { .. }
+                                if !self.has_native_window =>
+                            {
+                                self.deferred.push(control);
                             }
                             Control::CreateWindow {
                                 id,
@@ -474,6 +544,10 @@ enum Event<Message: 'static> {
     },
     EventLoopAwakened(winit::event::Event<Message>),
     Exit,
+    #[cfg(target_os = "android")]
+    Resumed,
+    #[cfg(target_os = "android")]
+    Suspended,
 }
 
 #[derive(Debug)]
@@ -648,7 +722,10 @@ async fn run_instance<P>(
                     .map(conversion::theme_mode)
                     .unwrap_or_default();
 
-                if system_theme != window_theme {
+                // ANDROID: winit reports no window theme there; keep the one from `android::set_system_theme`.
+                if cfg!(not(target_os = "android"))
+                    && system_theme != window_theme
+                {
                     system_theme = window_theme;
 
                     runtime.broadcast(subscription::Event::SystemThemeChanged(
@@ -714,6 +791,38 @@ async fn run_instance<P>(
                 is_window_opening = false;
             }
             Event::EventLoopAwakened(event) => {
+                // ANDROID: pick up what Java callbacks queued since the last wake-up.
+                #[cfg(target_os = "android")]
+                for injected in android::drain() {
+                    match injected {
+                        android::Injected::Event(event) => {
+                            for (id, window) in window_manager.iter_mut() {
+                                events.push((id, event.clone()));
+                                window.raw.request_redraw();
+                            }
+                        }
+                        android::Injected::Theme(mode) => {
+                            run_action(
+                                Action::System(system::Action::NotifyTheme(
+                                    mode,
+                                )),
+                                &program,
+                                &mut runtime,
+                                &mut compositor,
+                                &mut events,
+                                &mut messages,
+                                &mut clipboard,
+                                &mut control_sender,
+                                &mut user_interfaces,
+                                &mut window_manager,
+                                &mut ui_caches,
+                                &mut is_window_opening,
+                                &mut system_theme,
+                            );
+                        }
+                    }
+                }
+
                 match event {
                     event::Event::NewEvents(event::StartCause::Init) => {
                         for (_id, window) in window_manager.iter_mut() {
@@ -787,6 +896,11 @@ async fn run_instance<P>(
                             continue;
                         }
 
+                        // ANDROID: nothing to draw on while the app is in the background.
+                        if window.surface.is_none() {
+                            continue;
+                        }
+
                         // Window was resized between redraws
                         if window.surface_version
                             != window.state.surface_version()
@@ -803,7 +917,10 @@ async fn run_instance<P>(
                             layout_span.finish();
 
                             current_compositor.configure_surface(
-                                &mut window.surface,
+                                window
+                                    .surface
+                                    .as_mut()
+                                    .expect("Get window surface"),
                                 physical_size.width,
                                 physical_size.height,
                             );
@@ -981,7 +1098,10 @@ async fn run_instance<P>(
                         let present_span = debug::present(id);
                         match current_compositor.present(
                             &mut window.renderer,
-                            &mut window.surface,
+                            window
+                                .surface
+                                .as_mut()
+                                .expect("Get window surface"),
                             window.state.viewport(),
                             window.state.background_color(),
                             || window.raw.pre_present_notify(),
@@ -1003,15 +1123,19 @@ async fn run_instance<P>(
                                         window.state.physical_size();
 
                                     if error == compositor::SurfaceError::Lost {
-                                        window.surface = current_compositor
-                                            .create_surface(
+                                        window.surface = Some(
+                                            current_compositor.create_surface(
                                                 window.raw.clone(),
                                                 physical_size.width,
                                                 physical_size.height,
-                                            );
+                                            ),
+                                        );
                                     } else {
                                         current_compositor.configure_surface(
-                                            &mut window.surface,
+                                            window
+                                                .surface
+                                                .as_mut()
+                                                .expect("Get window surface"),
                                             physical_size.width,
                                             physical_size.height,
                                         );
@@ -1105,6 +1229,20 @@ async fn run_instance<P>(
                                 &mut system_theme,
                             );
                         } else {
+                            // ANDROID: the user may have dismissed the keyboard while a text field kept focus; a new touch lets the next IME request show it again.
+                            #[cfg(target_os = "android")]
+                            if let winit::event::WindowEvent::Touch(touch) =
+                                &window_event
+                                && touch.phase
+                                    == winit::event::TouchPhase::Started
+                            {
+                                window.reshow_keyboard();
+
+                                if let Some(platform) = android::platform() {
+                                    platform.touch_started();
+                                }
+                            }
+
                             window.state.update(
                                 &program,
                                 &window.raw,
@@ -1270,6 +1408,33 @@ async fn run_instance<P>(
                 }
             }
             Event::Exit => break,
+            #[cfg(target_os = "android")]
+            Event::Suspended => {
+                for (_id, window) in window_manager.iter_mut() {
+                    window.surface = None;
+                }
+            }
+            #[cfg(target_os = "android")]
+            Event::Resumed => {
+                let Some(compositor) = compositor.as_mut() else {
+                    continue;
+                };
+
+                for (_id, window) in window_manager.iter_mut() {
+                    if window.surface.is_none() {
+                        let size = window.state.physical_size();
+
+                        window.surface = Some(compositor.create_surface(
+                            window.raw.clone(),
+                            size.width,
+                            size.height,
+                        ));
+                        window.surface_version = window.state.surface_version();
+                    }
+
+                    window.raw.request_redraw();
+                }
+            }
         }
     }
 

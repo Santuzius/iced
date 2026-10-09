@@ -52,6 +52,15 @@ impl Clipboard {
 
     /// Reads the current content of the [`Clipboard`] as text.
     pub fn read(&self, kind: Kind) -> Option<String> {
+        // ANDROID: `window_clipboard` has no Android backend; the app's Java side has the clipboard.
+        #[cfg(target_os = "android")]
+        if let Some(platform) = crate::android::platform() {
+            return match kind {
+                Kind::Standard => platform.read_clipboard(),
+                Kind::Primary => None,
+            };
+        }
+
         match &self.state {
             State::Connected { clipboard, .. } => match kind {
                 Kind::Standard => clipboard.read().ok(),
@@ -63,6 +72,16 @@ impl Clipboard {
 
     /// Writes the given text contents to the [`Clipboard`].
     pub fn write(&mut self, kind: Kind, contents: String) {
+        // ANDROID: see `read`.
+        #[cfg(target_os = "android")]
+        if let Some(platform) = crate::android::platform() {
+            if kind == Kind::Standard {
+                platform.write_clipboard(contents);
+            }
+
+            return;
+        }
+
         match &mut self.state {
             State::Connected { clipboard, .. } => {
                 let result = match kind {
