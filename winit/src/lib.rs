@@ -1229,17 +1229,23 @@ async fn run_instance<P>(
                                 &mut system_theme,
                             );
                         } else {
-                            // ANDROID: the user may have dismissed the keyboard while a text field kept focus; a new touch lets the next IME request show it again.
+                            // ANDROID: the user may have dismissed the keyboard while a text field kept focus; lifting a finger lets the next IME request show it again. Not on touch-down: a tap outside the field unfocuses it only on lift, and the keyboard must not flash up meanwhile.
                             #[cfg(target_os = "android")]
                             if let winit::event::WindowEvent::Touch(touch) =
                                 &window_event
-                                && touch.phase
-                                    == winit::event::TouchPhase::Started
                             {
-                                window.reshow_keyboard();
-
-                                if let Some(platform) = android::platform() {
-                                    platform.touch_started();
+                                match touch.phase {
+                                    winit::event::TouchPhase::Started => {
+                                        if let Some(platform) =
+                                            android::platform()
+                                        {
+                                            platform.touch_started();
+                                        }
+                                    }
+                                    winit::event::TouchPhase::Ended => {
+                                        window.reshow_keyboard();
+                                    }
+                                    _ => {}
                                 }
                             }
 
