@@ -1279,6 +1279,8 @@ async fn run_instance<P>(
                         }
 
                         let mut uis_stale = false;
+                        // TOUCH: cursor-left events for windows whose last finger was lifted, handled in the next round.
+                        let mut fingers_lifted = Vec::new();
 
                         for (id, window) in window_manager.iter_mut() {
                             let interact_span = debug::interact(id);
@@ -1307,6 +1309,26 @@ async fn run_instance<P>(
                                     &mut clipboard,
                                     &mut messages,
                                 );
+
+                            // TOUCH: the lift itself was handled with the finger's position (a button's press needs it); afterwards the position goes, so nothing stays hovered.
+                            if matches!(
+                                window_events.last(),
+                                Some(core::Event::Touch(
+                                    core::touch::Event::FingerLifted { .. }
+                                        | core::touch::Event::FingerLost { .. }
+                                ))
+                            ) {
+                                window.state.forget_touch_cursor();
+                                fingers_lifted.push((
+                                    id,
+                                    core::Event::Mouse(
+                                        mouse::Event::CursorLeft,
+                                    ),
+                                ));
+                                window.request_redraw(
+                                    window::RedrawRequest::NextFrame,
+                                );
+                            }
 
                             #[cfg(feature = "unconditional-rendering")]
                             window.request_redraw(
@@ -1356,6 +1378,8 @@ async fn run_instance<P>(
                                 },
                             );
                         }
+
+                        events.extend(fingers_lifted);
 
                         if !messages.is_empty() || uis_stale {
                             let cached_interfaces: FxHashMap<_, _> =

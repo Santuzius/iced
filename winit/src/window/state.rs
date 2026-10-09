@@ -103,6 +103,11 @@ where
         self.viewport.scale_factor()
     }
 
+    /// Forgets where the last finger was, once it has been lifted: a touch screen has no cursor that stays on screen, and keeping its last position would leave whatever was tapped looking hovered.
+    pub fn forget_touch_cursor(&mut self) {
+        self.cursor_position = None;
+    }
+
     pub fn cursor(&self) -> mouse::Cursor {
         self.cursor_position
             .map(|cursor_position| {
