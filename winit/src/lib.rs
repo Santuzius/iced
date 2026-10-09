@@ -575,7 +575,7 @@ async fn run_instance<P>(
     display_handle: winit::event_loop::OwnedDisplayHandle,
     is_daemon: bool,
     graphics_settings: graphics::Settings,
-    default_fonts: Vec<Cow<'static, [u8]>>,
+    mut default_fonts: Vec<Cow<'static, [u8]>>,
     mut _system_theme: oneshot::Receiver<theme::Mode>,
 ) where
     P: Program + 'static,
@@ -659,7 +659,8 @@ async fn run_instance<P>(
                         let window = window.clone();
                         let display_handle = display_handle.clone();
                         let proxy = proxy.clone();
-                        let default_fonts = default_fonts.clone();
+                        // MEMORY: the font system is global and keeps the fonts for the life of the process, so only the first compositor loads them. A later one (after the last window closed and dropped the compositor) would add another copy of every owned font.
+                        let default_fonts = std::mem::take(&mut default_fonts);
 
                         async move {
                             let shell = Shell::new(proxy.clone());
@@ -674,7 +675,7 @@ async fn run_instance<P>(
 
                             if let Ok(compositor) = &mut compositor {
                                 for font in default_fonts {
-                                    compositor.load_font(font.clone());
+                                    compositor.load_font(font);
                                 }
                             }
 
