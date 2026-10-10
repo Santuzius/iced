@@ -84,6 +84,8 @@ where
                 ime_state: None,
                 #[cfg(target_os = "android")]
                 reshow_keyboard: false,
+                #[cfg(target_os = "android")]
+                unfocused: false,
             },
         );
 
@@ -178,6 +180,9 @@ where
     ime_state: Option<(Rectangle, input_method::Purpose)>,
     #[cfg(target_os = "android")]
     reshow_keyboard: bool,
+    /// ANDROID: the window gave its focus to a system window, e.g. the keyboard's language picker.
+    #[cfg(target_os = "android")]
+    unfocused: bool,
 }
 
 impl<P, C> Window<P, C>
@@ -318,7 +323,19 @@ where
         self.reshow_keyboard = true;
     }
 
+    /// ANDROID: whether the window has the input focus.
+    #[cfg(target_os = "android")]
+    pub fn set_focused(&mut self, focused: bool) {
+        self.unfocused = !focused;
+    }
+
     fn disable_ime(&mut self) {
+        // ANDROID: a text field stops asking for the keyboard while the window is unfocused. That happens when the keyboard opens its own language or input method picker, and hiding the keyboard then closes the picker with it. Leave it until the focus is back, where the field asks again.
+        #[cfg(target_os = "android")]
+        if self.unfocused {
+            return;
+        }
+
         #[cfg(target_os = "android")]
         {
             self.reshow_keyboard = false;

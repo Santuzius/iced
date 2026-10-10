@@ -1232,6 +1232,13 @@ async fn run_instance<P>(
                         } else {
                             // ANDROID: the user may have dismissed the keyboard while a text field kept focus; lifting a finger lets the next IME request show it again. Not on touch-down: a tap outside the field unfocuses it only on lift, and the keyboard must not flash up meanwhile.
                             #[cfg(target_os = "android")]
+                            if let winit::event::WindowEvent::Focused(focused) =
+                                &window_event
+                            {
+                                window.set_focused(*focused);
+                            }
+
+                            #[cfg(target_os = "android")]
                             if let winit::event::WindowEvent::Touch(touch) =
                                 &window_event
                             {
