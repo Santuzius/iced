@@ -633,6 +633,17 @@ pub fn key(key: winit::keyboard::Key) -> keyboard::Key {
     use winit::keyboard::NamedKey;
 
     match key {
+        // ANDROID: winit reports every key with a character as that character, so Enter, Tab and Space from a hardware keyboard arrive as "\n", "\t" and " "; other platforms name them.
+        #[cfg(target_os = "android")]
+        winit::keyboard::Key::Character(c)
+            if matches!(c.as_str(), "\n" | "\r" | "\t" | " ") =>
+        {
+            keyboard::Key::Named(match c.as_str() {
+                "\t" => Named::Tab,
+                " " => Named::Space,
+                _ => Named::Enter,
+            })
+        }
         winit::keyboard::Key::Character(c) => keyboard::Key::Character(c),
         winit::keyboard::Key::Named(named_key) => {
             keyboard::Key::Named(match named_key {
