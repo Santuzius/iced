@@ -492,6 +492,11 @@ where
                                 self.error = Some(error);
                                 event_loop.exit();
                             }
+                            // ANDROID: otherwise a window opened again after this close would be created next to it on the one native window, whose second surface fails with `ERROR_NATIVE_WINDOW_IN_USE_KHR`.
+                            #[cfg(target_os = "android")]
+                            Control::DiscardWindow(id) => {
+                                self.deferred.retain(|control| !matches!(control, Control::CreateWindow { id: deferred, .. } if *deferred == id));
+                            }
                             Control::SetAutomaticWindowTabbing(_enabled) => {
                                 #[cfg(target_os = "macos")]
                                 {
@@ -564,6 +569,9 @@ enum Control {
         scale_factor: f32,
     },
     SetAutomaticWindowTabbing(bool),
+    // ANDROID: the window was closed before Android provided a native window; forget its deferred `CreateWindow`.
+    #[cfg(target_os = "android")]
+    DiscardWindow(window::Id),
 }
 
 async fn run_instance<P>(
@@ -1617,6 +1625,12 @@ fn run_action<'a, P, C>(
                         id,
                         core::Event::Window(core::window::Event::Closed),
                     ));
+                } else if cfg!(target_os = "android") {
+                    // ANDROID: not created yet, so it may still wait for a native window.
+                    #[cfg(target_os = "android")]
+                    control_sender
+                        .start_send(Control::DiscardWindow(id))
+                        .expect("Send control action");
                 }
 
                 if window_manager.is_empty() {
